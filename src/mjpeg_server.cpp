@@ -93,6 +93,18 @@ MJPEGServer::~MJPEGServer()
   cleanUp();
 }
 
+void MJPEGServer::compressedImageCallback(const sensor_msgs::CompressedImagePtr & msg, const std::string& topic)
+{
+  ImageBuffer* image_buffer = getImageBuffer(topic);
+  boost::unique_lock<boost::mutex> lock(image_buffer->mutex_);
+  image_buffer->compressed_ = true;
+  // copy image
+  image_buffer->compressedData_ = msg->data;
+  //image_buffer->msg = *msg;
+  // notify senders
+  image_buffer->condition_.notify_all();
+}
+
 void MJPEGServer::imageCallback(const sensor_msgs::ImageConstPtr& msg, const std::string& topic)
 {
 
@@ -103,6 +115,7 @@ void MJPEGServer::imageCallback(const sensor_msgs::ImageConstPtr& msg, const std
   // notify senders
   image_buffer->condition_.notify_all();
 }
+
 
 void MJPEGServer::splitString(const std::string& str, std::vector<std::string>& tokens, const std::string& delimiter)
 {
@@ -419,16 +432,29 @@ void MJPEGServer::decodeParameter(const std::string& parameter, ParameterMap& pa
   }
 }
 
-ImageBuffer* MJPEGServer::getImageBuffer(const std::string& topic)
+ImageBuffer* MJPEGServer::getImageBuffer(const std::string& topic, bool compressed)
 {
   boost::unique_lock<boost::mutex> lock(image_maps_mutex_);
-  ImageSubscriberMap::iterator it = image_subscribers_.find(topic);
-  if (it == image_subscribers_.end())
+
+  SubscriberMap::iterator it = subscribers_.find(topic);
+  if (it == subscribers_.end())
   {
-    image_subscribers_[topic] = image_transport_.subscribe(topic, 1,
+	  SubscriberPtr ptr = SubscriberPtr(new Subscriber);
+
+	  if(compressed)
+	  {
+		  boost::function<void (const sensor_msgs::CompressedImagePtr & msg)> handler = boost::bind(&MJPEGServer::compressedImageCallback, this, _1, topic);
+		  ros::Subscriber sub = this->node_.subscribe<sensor_msgs::CompressedImage>(topic+"/compressed", 5, handler);
+		  ptr->compressed_image_subscriber_ = sub;
+	  }
+	  else
+	  {
+		  ptr->image_subscriber_ = image_transport_.subscribe(topic, 1,
                                                            boost::bind(&MJPEGServer::imageCallback, this, _1, topic));
-    image_buffers_[topic] = new ImageBuffer();
-    ROS_INFO("Subscribing to topic %s", topic.c_str());
+	  }
+	  subscribers_[topic] = ptr;
+	  image_buffers_[topic] = new ImageBuffer();
+	  ROS_INFO("Subscribing to topic %s", topic.c_str());
   }
   ImageBuffer* image_buffer = image_buffers_[topic];
   return image_buffer;
@@ -496,90 +522,97 @@ void MJPEGServer::sendStream(int fd, const char *parameter)
   while (!stop_requested_)
   {
     {
+      std::vector<uchar> encoded_buffer;
       /* wait for fresh frames */
       boost::unique_lock<boost::mutex> lock(image_buffer->mutex_);
       image_buffer->condition_.wait(lock);
 
-      //IplImage* image;
-      cv_bridge::CvImagePtr cv_msg;
-      try
+      if(!image_buffer->compressed_)
       {
-        if (cv_msg = cv_bridge::toCvCopy(image_buffer->msg, "bgr8"))
-        {
-          ;    //image = image_bridge.toIpl();
-        }
-        else
-        {
-          ROS_ERROR("Unable to convert %s image to bgr8", image_buffer->msg.encoding.c_str());
-          return;
-        }
-      }
-      catch (...)
-      {
-        ROS_ERROR("Unable to convert %s image to ipl format", image_buffer->msg.encoding.c_str());
-        return;
-      }
+		  //IplImage* image;
+		  cv_bridge::CvImagePtr cv_msg;
+		  try
+		  {
+			if ((cv_msg = cv_bridge::toCvCopy(image_buffer->msg, "bgr8")))
+			{
+			  ;    //image = image_bridge.toIpl();
+			}
+			else
+			{
+			  ROS_ERROR("Unable to convert %s image to bgr8", image_buffer->msg.encoding.c_str());
+			  return;
+			}
+		  }
+		  catch (...)
+		  {
+			ROS_ERROR("Unable to convert %s image to ipl format", image_buffer->msg.encoding.c_str());
+			return;
+		  }
 
-      // encode image
-      cv::Mat img = cv_msg->image;
-      std::vector<uchar> encoded_buffer;
-      std::vector<int> encode_params;
+		  // encode image
+		  cv::Mat img = cv_msg->image;
+		  std::vector<int> encode_params;
 
-      // invert
-      //int invert = 0;
-      if (parameter_map.find("invert") != parameter_map.end())
-      {
-        cv::Mat cloned_image = img.clone();
-        invertImage(cloned_image, img);
-      }
+		  // invert
+		  //int invert = 0;
+		  if (parameter_map.find("invert") != parameter_map.end())
+		  {
+			cv::Mat cloned_image = img.clone();
+			invertImage(cloned_image, img);
+		  }
 
-      // quality
-      int quality = 95;
-      if (parameter_map.find("quality") != parameter_map.end())
-      {
-        quality = stringToInt(parameter_map["quality"]);
-      }
-      encode_params.push_back(CV_IMWRITE_JPEG_QUALITY);
-      encode_params.push_back(quality);
+		  // quality
+		  int quality = 95;
+		  if (parameter_map.find("quality") != parameter_map.end())
+		  {
+			quality = stringToInt(parameter_map["quality"]);
+		  }
+		  encode_params.push_back(CV_IMWRITE_JPEG_QUALITY);
+		  encode_params.push_back(quality);
 
-      // resize image
-      if (parameter_map.find("width") != parameter_map.end() && parameter_map.find("height") != parameter_map.end())
-      {
-        int width = stringToInt(parameter_map["width"]);
-        int height = stringToInt(parameter_map["height"]);
-        if (width > 0 && height > 0)
-        {
-          cv::Mat img_resized;
-          cv::Size new_size(width, height);
-          cv::resize(img, img_resized, new_size);
-          cv::imencode(".jpeg", img_resized, encoded_buffer, encode_params);
-        }
-        else
-        {
-          cv::imencode(".jpeg", img, encoded_buffer, encode_params);
-        }
+		  // resize image
+		  if (parameter_map.find("width") != parameter_map.end() && parameter_map.find("height") != parameter_map.end())
+		  {
+			int width = stringToInt(parameter_map["width"]);
+			int height = stringToInt(parameter_map["height"]);
+			if (width > 0 && height > 0)
+			{
+			  cv::Mat img_resized;
+			  cv::Size new_size(width, height);
+			  cv::resize(img, img_resized, new_size);
+			  cv::imencode(".jpeg", img_resized, encoded_buffer, encode_params);
+			}
+			else
+			{
+			  cv::imencode(".jpeg", img, encoded_buffer, encode_params);
+			}
+		  }
+		  else
+		  {
+			cv::imencode(".jpeg", img, encoded_buffer, encode_params);
+		  }
+
+		  // copy encoded frame buffer
+		  frame_size = encoded_buffer.size();
+
+		  /* check if frame buffer is large enough, increase it if necessary */
+		  if (frame_size > max_frame_size)
+		  {
+			ROS_DEBUG("increasing frame buffer size to %d", frame_size);
+
+			max_frame_size = frame_size + tenk;
+			if ((tmp = (unsigned char*)realloc(frame, max_frame_size)) == NULL)
+			{
+			  free(frame);
+			  sendError(fd, 500, "not enough memory");
+			  return;
+			}
+			frame = tmp;
+		  }
       }
       else
       {
-        cv::imencode(".jpeg", img, encoded_buffer, encode_params);
-      }
-
-      // copy encoded frame buffer
-      frame_size = encoded_buffer.size();
-
-      /* check if frame buffer is large enough, increase it if necessary */
-      if (frame_size > max_frame_size)
-      {
-        ROS_DEBUG("increasing frame buffer size to %d", frame_size);
-
-        max_frame_size = frame_size + tenk;
-        if ((tmp = (unsigned char*)realloc(frame, max_frame_size)) == NULL)
-        {
-          free(frame);
-          sendError(fd, 500, "not enough memory");
-          return;
-        }
-        frame = tmp;
+    	  encoded_buffer = image_buffer->compressedData_;
       }
 
       /* copy v4l2_buffer timeval to user space */
@@ -588,7 +621,6 @@ void MJPEGServer::sendStream(int fd, const char *parameter)
       memcpy(frame, &encoded_buffer[0], frame_size);
       ROS_DEBUG("got frame (size: %d kB)", frame_size / 1024);
     }
-
     /*
      * print the individual mimetype and the length
      * sending the content-length fixes random stream disruption observed
@@ -1065,16 +1097,16 @@ void MJPEGServer::stop()
 void MJPEGServer::decreaseSubscriberCount(const std::string topic)
 {
   boost::unique_lock<boost::mutex> lock(image_maps_mutex_);
-  ImageSubscriberCountMap::iterator it = image_subscribers_count_.find(topic);
-  if (it != image_subscribers_count_.end())
+  SubscriberMap::iterator it = subscribers_.find(topic);
+  if (it != subscribers_.end())
   {
-    if (image_subscribers_count_[topic] == 1) {
-      image_subscribers_count_.erase(it);
+    if (subscribers_[topic]->refcount == 1) {
+      subscribers_.erase(it);
       ROS_INFO("no subscribers for %s", topic.c_str());
     }
-    else if (image_subscribers_count_[topic] > 0) {
-      image_subscribers_count_[topic] = image_subscribers_count_[topic] - 1;
-      ROS_INFO("%lu subscribers for %s", image_subscribers_count_[topic], topic.c_str());
+    else if (subscribers_[topic]->refcount > 0) {
+      subscribers_[topic]->refcount--;
+      ROS_INFO("%lu subscribers for %s", subscribers_[topic]->refcount, topic.c_str());
     }
   }
   else
@@ -1086,30 +1118,27 @@ void MJPEGServer::decreaseSubscriberCount(const std::string topic)
 void MJPEGServer::increaseSubscriberCount(const std::string topic)
 {
   boost::unique_lock<boost::mutex> lock(image_maps_mutex_);
-  ImageSubscriberCountMap::iterator it = image_subscribers_count_.find(topic);
-  if (it == image_subscribers_count_.end())
+  SubscriberMap::iterator it = subscribers_.find(topic);
+  if (it == subscribers_.end())
   {
-    image_subscribers_count_.insert(ImageSubscriberCountMap::value_type(topic, 1));
+	  // Nothing to do here, subscribers are allocated in other place
+    //subscribers_.insert(SubscriberPtr(new Subscriber());
+	ROS_INFO("No subscribers for %s", topic.c_str());
   }
   else {
-    image_subscribers_count_[topic] = image_subscribers_count_[topic] + 1;
+    subscribers_[topic]->refcount++;
+    ROS_INFO("%lu subscribers for %s", subscribers_[topic]->refcount, topic.c_str());
   }
-  ROS_INFO("%lu subscribers for %s", image_subscribers_count_[topic], topic.c_str());
 }
 
 void MJPEGServer::unregisterSubscriberIfPossible(const std::string topic)
 {
   boost::unique_lock<boost::mutex> lock(image_maps_mutex_);
-  ImageSubscriberCountMap::iterator it = image_subscribers_count_.find(topic);
-  if (it == image_subscribers_count_.end() ||
-      image_subscribers_count_[topic] == 0)
+  SubscriberMap::iterator it = subscribers_.find(topic);
+  if (it == subscribers_.end() ||
+      subscribers_[topic]->refcount == 0)
   {
-    ImageSubscriberMap::iterator sub_it = image_subscribers_.find(topic);
-    if (sub_it != image_subscribers_.end())
-    {
-      ROS_INFO("Unsubscribing from %s", topic.c_str());
-      image_subscribers_.erase(sub_it);
-    }
+	  subscribers_.erase(it);
   }
 }
 }

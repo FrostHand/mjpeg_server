@@ -41,6 +41,8 @@
 #include <image_transport/image_transport.h>
 #include <cv_bridge/cv_bridge.h>
 
+#include <sensor_msgs/CompressedImage.h>
+
 #include <boost/thread/mutex.hpp>
 #include <boost/thread/condition.hpp>
 
@@ -88,12 +90,27 @@ class ImageBuffer
 public:
   ImageBuffer()
   {
+	  compressed_ = false;
   }
   sensor_msgs::Image msg;
   boost::condition_variable condition_;
   boost::mutex mutex_;
+  std::vector<uint8_t> compressedData_;
+
+  bool compressed_;
 };
 
+/**
+ * @class Subscriber
+ * generic subscriber that can use both ImageTransport or direct subscribing to compressed image topic
+ */
+struct Subscriber
+{
+	image_transport::Subscriber image_subscriber_;
+	ros::Subscriber compressed_image_subscriber_;
+	size_t refcount;
+	Subscriber() : refcount (0) {}
+};
 /**
  * @class MJPEGServer
  * @brief
@@ -146,14 +163,22 @@ public:
 
 private:
   typedef std::map<std::string, ImageBuffer*> ImageBufferMap;
-  typedef std::map<std::string, image_transport::Subscriber> ImageSubscriberMap;
-  typedef std::map<std::string, size_t> ImageSubscriberCountMap;
+
+  typedef boost::shared_ptr<Subscriber> SubscriberPtr;
+  typedef std::map<std::string, SubscriberPtr > SubscriberMap;
+  //typedef std::map<std::string, image_transport::Subscriber> ImageSubscriberMap;
+  //typedef std::map<std::string, ros::Subscriber> CompressedImageSubscriberMap;
+  //typedef std::map<std::string, size_t> ImageSubscriberCountMap;
   typedef std::map<std::string, std::string> ParameterMap;
 
   std::string header;
 
-  ImageBuffer* getImageBuffer(const std::string& topic);
+  ImageBuffer* getImageBuffer(const std::string& topic, bool compressed = false);
 
+  /// callback for compressed image
+  void compressedImageCallback(const sensor_msgs::CompressedImagePtr & msg, const std::string& topic);
+
+  /// generic image callback
   void imageCallback(const sensor_msgs::ImageConstPtr& msg, const std::string& topic);
 
   /**
@@ -314,8 +339,10 @@ private:
   char* www_folder_;
 
   ImageBufferMap image_buffers_;
-  ImageSubscriberMap image_subscribers_;
-  ImageSubscriberCountMap image_subscribers_count_;
+  SubscriberMap subscribers_;
+  //ImageSubscriberMap image_subscribers_;
+  //CompressedImageSubscriberMap compressed_subscribers_;
+  //ImageSubscriberCountMap image_subscribers_count_;
   boost::mutex image_maps_mutex_;
 
 };
